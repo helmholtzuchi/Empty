@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live Heart Rate</title>
+<style>
+  :root {
+    --bg: #f6f6f4; --card: #ffffff; --text: #1b1b1a; --muted: #6b6b66;
+    --line: #e4e4df; --accent: #d63a3a; --ok: #2f8f5b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #121212; --card: #1c1c1c; --text: #f0f0ec; --muted: #9a9a94;
+            --line: #2c2c2c; --accent: #ff5a5a; --ok: #4cc283; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  main { max-width: 720px; margin: 0 auto; padding: 24px 16px; }
+  h1 { font-size: 18px; margin: 0 0 16px; font-weight: 600; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 20px; margin-bottom: 16px; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+  button { font: inherit; padding: 10px 16px; border-radius: 10px; border: 1px solid var(--line);
+           background: var(--card); color: var(--text); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button:disabled { opacity: .45; cursor: default; }
+  #status { color: var(--muted); font-size: 14px; }
+  #status.ok { color: var(--ok); }
+  .bpm { display: flex; align-items: baseline; gap: 10px; }
+  #bpm { font-size: 96px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+  .unit { color: var(--muted); font-size: 18px; }
+  #heart { color: var(--accent); font-size: 28px; transition: transform .12s ease; }
+  #heart.beat { transform: scale(1.35); }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 16px; }
+  .stat .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .stat .v { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  canvas { width: 100%; height: 200px; display: block; }
+  .note { color: var(--muted); font-size: 13px; }
+  @media (max-width: 480px) { #bpm { font-size: 72px; } .stats { grid-template-columns: repeat(2, 1fr); } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Live Heart Rate</h1>
+
+  <div class="card">
+    <div class="row">
+      <button id="connect" class="primary">Connect</button>
+      <button id="disconnect" disabled>Disconnect</button>
+      <button id="csv" disabled>Download CSV</button>
+      <span id="status">Not connected</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="bpm">
+      <span id="heart">♥</span>
+      <span id="bpm">--</span>
+      <span class="unit">bpm</span>
+    </div>
+    <div class="stats">
+      <div class="stat"><div class="k">Min</div><div class="v" id="min">--</div></div>
+      <div class="stat"><div class="k">Avg</div><div class="v" id="avg">--</div></div>
+      <div class="stat"><div class="k">Max</div><div class="v" id="max">--</div></div>
+      <div class="stat"><div class="k">Time</div><div class="v" id="elapsed">0:00</div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <canvas id="chart"></canvas>
+    <p class="note">Last 5 minutes</p>
+  </div>
+
+  <p class="note">
+    Turn on Heart Rate Broadcast in the Whoop app first. Works in Chrome or Edge on Mac, Windows,
+    Android, and ChromeOS. Safari, Firefox, and iPhone browsers don't support Web Bluetooth.
+  </p>
+</main>
+
+<script>
+const HR_SERVICE = 'heart_rate';
+const HR_MEASUREMENT = 'heart_rate_measurement';
+const WINDOW_MS = 5 * 60 * 1000;
+
+const $ = id => document.getElementById(id);
+let device = null, samples = [], startTime = null, manualDisconnect = false;
+
+function setStatus(text, ok = false) {
+  $('status').textContent = text;
+  $('status').className = ok ? 'ok' : '';
+}
+
+// Heart Rate Measurement (0x2A37): byte 0 is flags; bit 0 selects uint8 vs uint16 BPM.
+function parseHeartRate(view) {
+  const flags = view.getUint8(0);
+  return (flags & 0x01) ? view.getUint16(1, true) : view.getUint8(1);
+}
+
+function onMeasurement(event) {
+  const bpm = parseHeartRate(event.target.value);
+  if (!bpm) return; // 0 means no skin contact
+  const now = Date.now();
+  if (!startTime) startTime = now;
+  samples.push({ t: now, bpm });
+
+  $('bpm').textContent = bpm;
+  $('heart').classList.add('beat');
+  setTimeout(() => $('heart').classList.remove('beat'), 120);
+
+  const values = samples.map(s => s.bpm);
+  $('min').textContent = Math.min(...values);
+  $('max').textContent = Math.max(...values);
+  $('avg').textContent = Math.round(values.reduce((a, b) => a + b, 0) / values.length);
+  $('csv').disabled = false;
+  drawChart();
+}
+
+async function connectGatt() {
+  setStatus('Connecting…');
+  const server = await device.gatt.connect();
+  const service = await server.getPrimaryService(HR_SERVICE);
+  const characteristic = await service.getCharacteristic(HR_MEASUREMENT);
+  characteristic.addEventListener('characteristicvaluechanged', onMeasurement);
+  await characteristic.startNotifications();
+  setStatus('Connected to ' + (device.name || 'device'), true);
+  $('connect').disabled = true;
+  $('disconnect').disabled = false;
+}
+
+async function onDisconnected() {
+  $('connect').disabled = false;
+  $('disconnect').disabled = true;
+  if (manualDisconnect) { setStatus('Disconnected'); return; }
+  // Try to reconnect a few times if the strap drops out.
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    setStatus(`Connection lost, reconnecting (${attempt}/5)…`);
+    try { await connectGatt(); return; }
+    catch { await new Promise(r => setTimeout(r, 2000 * attempt)); }
+  }
+  setStatus('Disconnected. Click Connect to try again.');
+}
+
+$('connect').onclick = async () => {
+  if (!navigator.bluetooth) {
+    setStatus('Web Bluetooth isn\'t available in this browser. Use Chrome or Edge.');
+    return;
+  }
+  manualDisconnect = false;
+  try {
+    if (!device) {
+      device = await navigator.bluetooth.requestDevice({ filters: [{ services: [HR_SERVICE] }] });
+      device.addEventListener('gattserverdisconnected', onDisconnected);
+    }
+    await connectGatt();
+  } catch (err) {
+    setStatus(err.name === 'NotFoundError' ? 'No device selected' : 'Error: ' + err.message);
+  }
+};
+
+$('disconnect').onclick = () => {
+  manualDisconnect = true;
+  if (device && device.gatt.connected) device.gatt.disconnect();
+};
+
+$('csv').onclick = () => {
+  const rows = ['timestamp,bpm', ...samples.map(s => new Date(s.t).toISOString() + ',' + s.bpm)];
+  const blob = new Blob([rows.join('\n')], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'heart-rate-' + new Date().toISOString().slice(0, 19).replace(/:/g, '-') + '.csv';
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+
+function drawChart() {
+  const canvas = $('chart');
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, h);
+
+  const css = getComputedStyle(document.documentElement);
+  const now = Date.now();
+  const recent = samples.filter(s => now - s.t <= WINDOW_MS);
+  if (recent.length < 2) return;
+
+  const vals = recent.map(s => s.bpm);
+  const lo = Math.floor((Math.min(...vals) - 5) / 10) * 10;
+  const hi = Math.ceil((Math.max(...vals) + 5) / 10) * 10;
+  const pad = 32;
+  const x = t => pad + (1 - (now - t) / WINDOW_MS) * (w - pad);
+  const y = v => h - 8 - ((v - lo) / (hi - lo)) * (h - 16);
+
+  ctx.font = '11px system-ui, sans-serif';
+  ctx.fillStyle = css.getPropertyValue('--muted');
+  ctx.strokeStyle = css.getPropertyValue('--line');
+  ctx.lineWidth = 1;
+  for (let v = lo; v <= hi; v += (hi - lo > 40 ? 20 : 10)) {
+    ctx.beginPath(); ctx.moveTo(pad, y(v)); ctx.lineTo(w, y(v)); ctx.stroke();
+    ctx.fillText(v, 0, y(v) + 4);
+  }
+
+  ctx.strokeStyle = css.getPropertyValue('--accent');
+  ctx.lineWidth = 2;
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  recent.forEach((s, i) => i ? ctx.lineTo(x(s.t), y(s.bpm)) : ctx.moveTo(x(s.t), y(s.bpm)));
+  ctx.stroke();
+}
+
+setInterval(() => {
+  if (!startTime) return;
+  const sec = Math.floor((Date.now() - startTime) / 1000);
+  const h = Math.floor(sec / 3600), m = Math.floor(sec / 60) % 60, s = sec % 60;
+  $('elapsed').textContent = (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(s).padStart(2, '0');
+  drawChart();
+}, 1000);
+window.addEventListener('resize', drawChart);
+</script>
+</body>
+</html>
